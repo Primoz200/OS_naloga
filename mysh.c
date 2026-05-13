@@ -8,10 +8,13 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/utsname.h>
+#include <ctype.h>
 
 #define SHELL_NAME  "mysh"
 #define MAX_LINE    1024
 #define MAX_TOKENS  32
+#define MAX_PROC_PATH 4096
 
 char line[MAX_LINE];
 char* tokens[MAX_TOKENS];
@@ -20,6 +23,7 @@ int debugLevel = 0;
 char promptStr[9] = "mysh";
 int lastStatus = 0;
 int background = 0;
+static char proc_path[MAX_PROC_PATH] = "/proc";
 
 typedef int (*builtin_fn)(void); //builtin_fun = ptr na funckijo brez arg, vraca int
 
@@ -49,6 +53,16 @@ int builtin_linksoft(void);
 int builtin_linkread(void);
 int builtin_linklist(void);
 int builtin_cpcat(void);
+int builtin_pid(void);
+int builtin_pid(void);
+int builtin_uid(void);
+int builtin_euid(void);
+int builtin_gid(void);
+int builtin_egid(void);
+int builtin_sysinfo(void);
+int builtin_proc(void);
+int builtin_pids(void);
+int builtin_pinfo(void);
 
 typedef struct builtin_entry {
     char* name;
@@ -81,7 +95,17 @@ Builtin builtins[] = {
     {"linksoft", builtin_linksoft, "linksoft cilj ime - ustvari simbolicno povezavo"},
     {"linkread", builtin_linkread, "linkread ime - izpise cilj simbolicne povezave"},
     {"linklist", builtin_linklist, "izpise vse trde povezave v trenutnem imeniku na podano datoteko"},
-    {"cpcat", builtin_cpcat, "kopira iz src v dest, in naredi cat na izvoru"}
+    {"cpcat", builtin_cpcat, "kopira iz src v dest, in naredi cat na izvoru"},
+    {"pid", builtin_pid, ""},
+    {"ppid", builtin_pid, ""},
+    {"uid", builtin_uid, ""},
+    {"euid", builtin_euid, ""},
+    {"gid", builtin_gid, ""},
+    {"egid", builtin_egid, ""},
+    {"sysinfo", builtin_sysinfo, ""},
+    {"proc", builtin_proc, ""},
+    {"pids", builtin_pids, ""},
+    {"pinfo", builtin_pinfo, ""}
 };
 int nr_builtins = sizeof(builtins) / sizeof(builtins[0]);
 
@@ -94,6 +118,26 @@ Builtin* find_builtin(char *cmd){               //vrne kazalec na structuro, ki 
     }
 
     return NULL;
+}
+
+int is_pid_like(char* name){
+    if(*name == '\0') return 0; //false
+
+    for(int i=0; name[i]!='\0';i++){
+        if(!isdigit((char)name[i])){
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int compare_ints(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
 }
 
 int builtin_debug(){
@@ -364,35 +408,6 @@ int builtin_linklist(void) {
     return 0;
 }
 
-// int builtin_cpcat(){
-//     FILE* src = fopen(tokens[1], "rb");
-//     if (src == NULL) { int err = errno; perror("cpcat"); return err; }
-
-//     FILE* dest = fopen(tokens[2], "wb");
-//     if (dest == NULL) { int err = errno; perror("cpcat"); return err; }
-
-//     char buf[4096];
-//     size_t n;
-//     int err = 0;
-
-//     while((n = fread(buf, 1, sizeof(buf), src)) > 0){
-//         fwrite(buf, n, 1, stdout);
-
-//         if(cnt == 3){
-//             if (fwrite(buf, 1, n, dest) != n) {
-//                 perror("cpcat");
-//                 err = errno;
-//                 break;
-//             }
-//         }
-//     }
-
-//     if (!err && ferror(src)) { int err = errno; perror("cpcat"); err = errno; }
-
-//     fclose(src);
-//     fclose(dest);
-//     return 0;
-// }
 int builtin_cpcat(void) {
     if (cnt < 2) return 1;
 
@@ -422,6 +437,162 @@ int builtin_cpcat(void) {
 
     close(src);
     if (dst != STDOUT_FILENO) close(dst);
+    return 0;
+}
+
+int builtin_pid(){
+    int pid = getpid();
+    printf("%d\n", pid);
+    return 0;
+}
+
+int builtin_ppid(){
+    int pid = getppid();
+    printf("%d\n", pid);
+    return 0;
+}
+
+int builtin_uid(){
+    printf("%d\n", getuid());
+    return 0;
+}
+
+int builtin_euid(){
+    printf("%d\n", geteuid());
+    return 0;
+}
+
+int builtin_gid(){
+    printf("%d\n", getgid());
+    return 0;
+}
+
+int builtin_egid(){
+    printf("%d\n", getegid());
+    return 0;
+}
+
+int builtin_sysinfo(){
+    struct utsname u;
+    if(uname(&u) != 0){
+        int err = errno;
+        perror("uname");
+        return err;
+    }
+
+    printf("Sysname: %s\n", u.sysname);
+    printf("Nodename: %s\n", u.nodename);
+    printf("Release: %s\n", u.release);
+    printf("Version: %s\n", u.version);
+    printf("Machine: %s\n", u.machine);
+
+    return 0;
+}
+
+int builtin_proc() {
+    if (cnt == 1) {
+        printf("%s\n", proc_path);
+        return 0;
+    }
+
+    if (cnt == 2) {
+        if (access(tokens[1], F_OK | R_OK) != 0) {
+            return 1;
+        }
+
+        strncpy(proc_path, tokens[1], MAX_PROC_PATH - 1);
+        proc_path[MAX_PROC_PATH - 1] = '\0';
+        return 0;
+    }
+
+    return 1;
+}
+
+int builtin_pids() {
+    int pids[4096];
+    int pid_cnt = 0;
+
+    DIR *dir = opendir(proc_path);
+    if (dir == NULL) return 1;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (is_pid_like(entry->d_name)) {
+            if (pid_cnt < 4096) {
+                pids[pid_cnt] = atoi(entry->d_name);
+                pid_cnt++;
+            }
+        }
+    }
+    closedir(dir);
+    qsort(pids, pid_cnt, sizeof(int), compare_ints);
+
+    for (int i = 0; i < pid_cnt; i++) {
+        printf("%d\n", pids[i]);
+    }
+
+    return 0;
+}
+
+int builtin_pinfo(){
+    printf("%5s %5s %6s %s\n", "PID", "PPID", "STANJE", "IME");
+    int pids[4096];
+    DIR* dir = opendir(proc_path);
+    if(dir == NULL){
+        return 1;
+    }
+    struct dirent* entry;
+    int pid_cnt = 0;
+    while((entry = readdir(dir))!=NULL){
+        if (is_pid_like(entry->d_name)){
+            pids[pid_cnt] = atoi(entry->d_name);
+            pid_cnt++;
+        }
+    }
+    closedir(dir);
+    qsort(pids, pid_cnt, sizeof(int), compare_ints);
+
+    for(int i=0; i<pid_cnt; i++){
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%d/stat", proc_path, pids[i]);
+
+        FILE* f = fopen(path, "r");
+        if(f==NULL) continue;
+
+        char line[4096];
+        if (fgets(line, sizeof(line), f) == NULL) {
+            fclose(f);
+            continue;
+        }
+
+        fclose(f);
+        int pid;
+        int ppid;
+        char state;
+        char name[256];
+
+        char *open_paren = strchr(line, '(');
+        char *close_paren = strrchr(line, ')');
+
+        if (open_paren == NULL || close_paren == NULL || close_paren <= open_paren) {
+            continue;
+        }
+
+        sscanf(line, "%d", &pid);
+
+        int name_len = close_paren - open_paren - 1;
+        if (name_len >= (int)sizeof(name)) {
+            name_len = sizeof(name) - 1;
+        }
+
+        strncpy(name, open_paren + 1, name_len);
+        name[name_len] = '\0';
+
+        sscanf(close_paren + 2, "%c %d", &state, &ppid);
+
+        printf("%5d %5d %6c %s\n", pid, ppid, state, name);
+    }
+
     return 0;
 }
 
