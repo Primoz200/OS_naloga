@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <ctype.h>
 
 #define SHELL_NAME  "mysh"
@@ -23,7 +24,7 @@ int debugLevel = 0;
 char promptStr[9] = "mysh";
 int lastStatus = 0;
 int background = 0;
-static char proc_path[MAX_PROC_PATH] = "/proc";
+char proc_path[MAX_PROC_PATH] = "/proc";
 
 typedef int (*builtin_fn)(void); //builtin_fun = ptr na funckijo brez arg, vraca int
 
@@ -553,7 +554,7 @@ int builtin_pinfo(){
     qsort(pids, pid_cnt, sizeof(int), compare_ints);
 
     for(int i=0; i<pid_cnt; i++){
-        char path[4096];
+        char path[MAX_PROC_PATH+32];
         snprintf(path, sizeof(path), "%s/%d/stat", proc_path, pids[i]);
 
         FILE* f = fopen(path, "r");
@@ -622,14 +623,23 @@ int execute_builtin(Builtin *b){
 }
 
 int execute_external(void){
-    char cmd[MAX_LINE] = "";
-    for (int i = 0; i < cnt; i++){
-        if (i > 0) strcat(cmd, " ");
-        strcat(cmd, tokens[i]);
+    fflush(stdin);
+    pid_t pid = fork();
+
+    if(pid == 0){
+        execvp(tokens[0], tokens);
+        perror("exec");
+        exit(127);
+    }else if(pid > 0){
+        int status; 
+        waitpid(pid, &status, 0);
+        lastStatus = WEXITSTATUS(status);
+    }else {
+        perror("fork");
+        return 1;
     }
-    printf("External command '%s'\n", cmd);
-    lastStatus = 0;
-    return 0;
+
+    return lastStatus;
 }
 
 int tokenize(char *line){
@@ -693,7 +703,7 @@ void parse(){
 
 void repl(int interactive){
     while (1){
-
+        background = 0;
         if (interactive){
             printf(SHELL_NAME "> ");
             fflush(stdout);     //da se takoj pojavi
@@ -727,6 +737,7 @@ void repl(int interactive){
             }
         }
         parse();
+        tokens[cnt] = NULL;
 
         Builtin *b = find_builtin(tokens[0]);
         if (b) execute_builtin(b);
