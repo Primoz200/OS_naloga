@@ -11,6 +11,7 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <signal.h>
 
 #define SHELL_NAME  "mysh"
 #define MAX_LINE    1024
@@ -24,8 +25,12 @@ int debugLevel = 0;
 char promptStr[9] = "mysh";
 int lastStatus = 0;
 int background = 0;
+char *input_redir = NULL;
+char *output_redir = NULL;
 char proc_path[MAX_PROC_PATH] = "/proc";
 
+
+int tokenize(char* line);
 typedef int (*builtin_fn)(void); //builtin_fun = ptr na funckijo brez arg, vraca int
 
 int builtin_debug(void);
@@ -64,6 +69,9 @@ int builtin_sysinfo(void);
 int builtin_proc(void);
 int builtin_pids(void);
 int builtin_pinfo(void);
+int builtin_waitone(void);
+int builtin_waitall(void);
+int builtin_pipes(void);
 
 typedef struct builtin_entry {
     char* name;
@@ -106,7 +114,10 @@ Builtin builtins[] = {
     {"sysinfo", builtin_sysinfo, ""},
     {"proc", builtin_proc, ""},
     {"pids", builtin_pids, ""},
-    {"pinfo", builtin_pinfo, ""}
+    {"pinfo", builtin_pinfo, ""},
+    {"waitone", builtin_waitone, "waitone [pid] - pocaka na otroka (ali kateregakoli)"},
+    {"waitall", builtin_waitall, "waitall - pocaka na vse otroke"},
+    {"pipes", builtin_pipes, ""}
 };
 int nr_builtins = sizeof(builtins) / sizeof(builtins[0]);
 
@@ -139,6 +150,34 @@ int compare_ints(const void *a, const void *b) {
     if (x < y) return -1;
     if (x > y) return 1;
     return 0;
+}
+
+void sigchld_handler(int sig){
+    (void)sig;
+
+    while(waitpid(-1, NULL, WNOHANG)>0);
+}
+
+void manageRedirects(){                    
+    if(input_redir){
+        int fd = open(input_redir, O_RDONLY);
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+
+    if(output_redir){
+        int fd = open(output_redir, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+    }
+}
+
+int dolzina_do_narekovaja(char* s){
+    int res = 0;
+    while(s[res+1] != '"'){
+        res++;
+    }
+    return res;
 }
 
 int builtin_debug(){
@@ -410,33 +449,47 @@ int builtin_linklist(void) {
 }
 
 int builtin_cpcat(void) {
-    if (cnt < 2) return 1;
+    int src = STDIN_FILENO;
+    int dst = STDOUT_FILENO;
 
-    int src = open(tokens[1], O_RDONLY);
-    if (src < 0) {
-        int err = errno;
-        perror("cpcat");
-        return err;
+    // source
+    if (cnt > 1) {
+        if (strcmp(tokens[1], "-") != 0) {
+            src = open(tokens[1], O_RDONLY);
+            if (src < 0) {
+                int err = errno;
+                perror("cpcat");
+                return err;
+            }
+        }
     }
 
-    int dst = STDOUT_FILENO;
-    if (cnt >= 3) {
+    // destination
+    if (cnt > 2) {
         dst = open(tokens[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dst < 0) {
             int err = errno;
             perror("cpcat");
-            close(src);
+            if (src != STDIN_FILENO) close(src);
             return err;
         }
     }
 
-    char buf[4096];
+    char *buf = malloc(4096);
+    if (buf == NULL) {
+        int err = errno;
+        if (src != STDIN_FILENO) close(src);
+        if (dst != STDOUT_FILENO) close(dst);
+        return err;
+    }
+
     ssize_t n;
-    while ((n = read(src, buf, sizeof(buf))) > 0) {
+    while ((n = read(src, buf, 4096)) > 0) {
         write(dst, buf, n);
     }
 
-    close(src);
+    free(buf);
+    if (src != STDIN_FILENO) close(src);
     if (dst != STDOUT_FILENO) close(dst);
     return 0;
 }
@@ -598,8 +651,25 @@ int builtin_pinfo(){
 }
 
 int builtin_exit(){
-    int code = (cnt >= 2) ? atoi(tokens[1]) : lastStatus;
-    exit(code);
+    // int code = (cnt >= 2) ? atoi(tokens[1]) : lastStatus;
+    // exit(code);
+
+    int status = lastStatus;
+
+    if (cnt > 1) {
+        char* end = NULL;
+        errno = 0;
+
+        long value = strtol((const char*)tokens[1], &end, 10);
+
+        if (end == (char*)tokens[1] || *end != '\0' || errno == ERANGE) {
+            status = -1;
+        } else {
+            status = (int)value;
+        }
+    }
+
+    return status;
 }
 
 int builtin_help(void) {
@@ -610,16 +680,176 @@ int builtin_help(void) {
     return 0;
 }
 
+int builtin_waitone(){
+    pid_t target = -1; //katerikoli otrok
+    if(cnt >= 2){
+        target = (pid_t)strtol(tokens[1], NULL, 10);
+    }
+
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &block, &old);
+
+    int wstatus;
+    if(waitpid(target, &wstatus, 0) < 0){
+        int err = errno;
+        if(err == ECHILD){
+            lastStatus = 0;
+            return 0;
+        }
+        perror("waitone");
+        return err;
+    }
+
+    int ret;
+    if (WIFEXITED(wstatus))
+        ret = WEXITSTATUS(wstatus);
+    else if (WIFSIGNALED(wstatus))
+        ret = 128 + WTERMSIG(wstatus); 
+    else
+        ret = 1;
+
+    lastStatus = ret;
+    return ret;
+}
+
+int builtin_waitall(){
+    int wstatus;
+    while(1){
+        if(waitpid(-1, &wstatus, 0) < 0){
+            int err = errno;
+            if(err == ECHILD){
+                break;
+            }
+            perror("waitall");
+            return err;
+        }
+    }
+    lastStatus = 0;
+    return 0;
+}
+
+int builtin_pipes(){
+    int n = cnt - 1;
+    if (n < 2 ) return 1;
+
+    int pfds[n-1][2];
+    for(int i = 0; i < n-1; i++){
+        if(pipe(pfds[i]) < 0){
+            perror("pipe");
+            return errno;
+        }
+    }
+
+    pid_t pids[n];
+
+    for(int i = 0; i < n; i++){
+        char stage[MAX_LINE];
+        strncpy(stage, tokens[i+1], MAX_LINE);
+        stage[MAX_LINE-1] = '\0';
+
+        if((pids[i] = fork()) < 0 ){perror("fork"); return errno;}
+
+        if(pids[i] == 0){
+            if (i == 0){
+                if (input_redir){
+                    int fd = open(input_redir, O_RDONLY);
+                    dup2(fd, STDIN_FILENO);
+                    close(fd);
+                }
+            }else{
+                dup2(pfds[i-1][0], STDIN_FILENO);
+            } 
+
+            if(i == n-1){
+                if (output_redir) {
+                    int fd = open(output_redir, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+                    dup2(fd, STDOUT_FILENO);
+                    close(fd);
+                }
+            }else{
+                dup2(pfds[i][1], STDOUT_FILENO);
+            }
+
+            
+            for(int j = 0; j < n-1; j++){
+                close(pfds[j][0]);
+                close(pfds[j][1]);
+            }
+
+            tokenize(stage);
+            tokens[cnt] = NULL;
+
+            Builtin* b = find_builtin(tokens[0]);
+            if(b){
+                _exit(b->fn());
+            }else {
+                execvp(tokens[0], tokens);
+                perror("exec");
+                exit(127);
+            }
+        }
+    }
+
+    for (int i = 0; i < n-1; i++) {
+        close(pfds[i][0]);
+        close(pfds[i][1]);
+    }
+
+    int status = 0;
+    if (!background) {
+        for (int i = 0; i < n; i++) {
+            waitpid(pids[i], &status, 0);
+        }
+        lastStatus = WEXITSTATUS(status);
+    } else {
+        lastStatus = 0;
+    }
+
+    return lastStatus;
+}
+
 
 int execute_builtin(Builtin *b){
     if (debugLevel > 0){
         printf("Executing builtin '%s' in %s\n", b->name, background ? "background" : "foreground" );
     }
-    int ret = b->fn();
-    if(strcmp(b->name, "status") != 0){
-        lastStatus = ret;
+    if(!background){
+        int saved_in = dup(STDIN_FILENO);
+        int saved_out = dup(STDOUT_FILENO);
+
+        manageRedirects();
+        fflush(stdout);
+        int ret = b->fn();
+
+        fflush(stdout);
+        dup2(saved_in, STDIN_FILENO);
+        dup2(saved_out, STDOUT_FILENO);
+        close(saved_in);
+        close(saved_out);
+
+        if(strcmp(b->name, "status") != 0){
+            lastStatus = ret;
+        }
+
+        return ret;
     }
-    return ret;
+
+    pid_t pid = fork();
+
+    if(pid < 0){
+        int ret = errno;
+        perror("execute_builtin");
+        return ret;
+    }else if(pid == 0){
+        manageRedirects();
+        int status = b->fn();
+        _exit(status);
+    }else {
+        lastStatus = 0;
+        return 0;
+    }
 }
 
 int execute_external(void){
@@ -627,13 +857,19 @@ int execute_external(void){
     pid_t pid = fork();
 
     if(pid == 0){
+        manageRedirects();
         execvp(tokens[0], tokens);
         perror("exec");
         exit(127);
     }else if(pid > 0){
-        int status; 
-        waitpid(pid, &status, 0);
-        lastStatus = WEXITSTATUS(status);
+        if(background){
+            lastStatus = 0;
+        }
+        else {
+            int status;     
+            waitpid(pid, &status, 0);
+            lastStatus = WEXITSTATUS(status);
+        }
     }else {
         perror("fork");
         return 1;
@@ -678,9 +914,8 @@ int tokenize(char *line){
 }
 
 void parse(){
-    char *input_redir = NULL;
-    char *output_redir = NULL;
-
+    input_redir = NULL;
+    output_redir = NULL;
     if (cnt > 0 && tokens[cnt-1][0] == '&'){
         background = 1;
         cnt--;
@@ -695,10 +930,8 @@ void parse(){
         cnt--;
     }
 
-    if (input_redir) printf("Input redirect: '%s'\n", input_redir);
-    if (output_redir) printf("Output redirect: '%s'\n", output_redir);
-    if (background) printf("Background: %d\n", background);
-
+    //if (input_redir) printf("Input redirect: '%s'\n", input_redir);
+    //if (output_redir) printf("Output redirect: '%s'\n", output_redir);
 }
 
 void repl(int interactive){
@@ -749,6 +982,14 @@ void repl(int interactive){
 
 int main(){
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    struct sigaction sa;
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  // da fgets ne bo prekinjen
+    sigaction(SIGCHLD, &sa, NULL);
+
+
     int interactive = isatty(STDIN_FILENO);
 
     repl(interactive);
