@@ -17,21 +17,42 @@
 #define MAX_LINE    1024
 #define MAX_TOKENS  32
 #define MAX_PROC_PATH 4096
+#define MAX_VAR_CNT 256
 
 char line[MAX_LINE];
 char* tokens[MAX_TOKENS];
 int cnt;
 int debugLevel = 0;
-char promptStr[9] = "mysh";
+char promptStr[9] = SHELL_NAME;
 int lastStatus = 0;
 int background = 0;
 char *input_redir = NULL;
 char *output_redir = NULL;
 char proc_path[MAX_PROC_PATH] = "/proc";
+char injected[MAX_LINE] = "";
 
+
+int var_cnt = 0;
+typedef struct var {
+    char name[32];
+    char value[32];
+} var;
+
+var variables[MAX_VAR_CNT];
+
+char history[100][MAX_LINE];
+int history_cnt = 0;
 
 int tokenize(char* line);
 typedef int (*builtin_fn)(void); //builtin_fun = ptr na funckijo brez arg, vraca int
+
+
+//================BUILTIN DECLARATIONS================================
+typedef struct builtin_entry {
+    char* name;
+    builtin_fn fn;
+    char *help;
+} Builtin;
 
 int builtin_debug(void);
 int builtin_prompt(void);
@@ -72,12 +93,9 @@ int builtin_pinfo(void);
 int builtin_waitone(void);
 int builtin_waitall(void);
 int builtin_pipes(void);
-
-typedef struct builtin_entry {
-    char* name;
-    builtin_fn fn;
-    char *help;
-} Builtin;
+int builtin_var(void);
+int builtin_varlist(void);
+int builtin_history(void);
 
 Builtin builtins[] = {
     {"debug", builtin_debug, "debug [level] nastavi/pokaze debug level"},
@@ -117,11 +135,15 @@ Builtin builtins[] = {
     {"pinfo", builtin_pinfo, ""},
     {"waitone", builtin_waitone, "waitone [pid] - pocaka na otroka (ali kateregakoli)"},
     {"waitall", builtin_waitall, "waitall - pocaka na vse otroke"},
-    {"pipes", builtin_pipes, ""}
+    {"pipes", builtin_pipes, ""},
+    {"var", builtin_var, "var ime value new (ce je prvic deklarirana), max len imena in value = 31"},
+    {"varlist", builtin_varlist, "izpise definirane spremenljivke"},
+    {"history", builtin_history, "history [nr] optional nr, za izvedbo nr-tega ukaza (0-99), 0 je ponovitev trenutnega ukaza"}
 };
 int nr_builtins = sizeof(builtins) / sizeof(builtins[0]);
 
 
+//======================================HELPERS============================================
 Builtin* find_builtin(char *cmd){               //vrne kazalec na structuro, ki opisuje zahtevan builtin command
     for (int i = 0; i < nr_builtins; i++){
         if(strcmp(builtins[i].name, cmd)==0){
@@ -178,6 +200,71 @@ int dolzina_do_narekovaja(char* s){
         res++;
     }
     return res;
+}
+
+int find_var(char* var){
+    for(int i = 0; i < var_cnt; i++){
+        if(strcmp(var, variables[i].name) == 0){
+            return i;
+        }
+    }
+    printf("No such variable: %s \n", var);
+    return -1;
+}
+
+
+//============================BUILTINS===================================
+int builtin_var(){
+    if (cnt < 3) return 1;
+
+
+    if(cnt == 4 && strcmp(tokens[3], "new") == 0){
+        for(int i = 0; i < 32; i++){
+            variables[var_cnt].name[i] = '\0';
+            variables[var_cnt].value[i] = '\0';
+        }
+
+        strncpy(variables[var_cnt].name, tokens[1], 31);
+        strncpy(variables[var_cnt].value, tokens[2], 31);
+        var_cnt++;
+        return 0;
+    }
+
+    for (int i = 0; i < var_cnt; i++){
+        if (strcmp(variables[i].name, tokens[1]) == 0){
+            strncpy(variables[i].value, tokens[2], 31);
+            variables[i].value[31] = '\0';
+            return 0;
+        }
+    }
+
+    printf("Pozor: nova spremenljivka brez new keyworda\n");
+    return 1;
+}
+
+int builtin_varlist(){
+    for (int i = 0; i < var_cnt; i++){
+        printf("%s = %s\n", variables[i].name, variables[i].value);
+    }
+    return 0;
+}
+
+int builtin_history(){
+    if(cnt == 2){
+        int i = atoi(tokens[1]);
+        if(i >= history_cnt || i > 99){
+            printf("Neveljavno stevilo");
+            return 1;
+        }
+        strncpy(injected, history[(history_cnt % 100)-1-i], MAX_LINE);
+        return 0;
+    }
+
+
+    for(int i = 0; i < history_cnt; i++){
+        printf("%s", history[i]);
+    }
+    return 0;
 }
 
 int builtin_debug(){
@@ -810,7 +897,6 @@ int builtin_pipes(){
     return lastStatus;
 }
 
-
 int execute_builtin(Builtin *b){
     if (debugLevel > 0){
         printf("Executing builtin '%s' in %s\n", b->name, background ? "background" : "foreground" );
@@ -906,9 +992,14 @@ int tokenize(char *line){
         tokens[cnt] = p;
         cnt++;
         while(*p != '\0' && !isspace(*p)) p++;
-
         *p = '\0';
         p++;
+
+        
+        if (tokens[cnt-1][0] == '$') {
+            int a = find_var(tokens[cnt-1] + 1);
+            if (a != -1) tokens[cnt-1] = variables[a].value;
+        }   
     }
     return cnt;
 }
@@ -930,6 +1021,7 @@ void parse(){
         cnt--;
     }
 
+
     //if (input_redir) printf("Input redirect: '%s'\n", input_redir);
     //if (output_redir) printf("Output redirect: '%s'\n", output_redir);
 }
@@ -942,11 +1034,20 @@ void repl(int interactive){
             fflush(stdout);     //da se takoj pojavi
         }
 
-        if (fgets(line, sizeof(line), stdin) == NULL){  //EOF
-            if(interactive) printf("\n");
-            break;
+        if(injected[0] != '\0'){
+            strncpy(line, injected, MAX_LINE);
+            printf("%s", injected);
+            injected[0] = '\0';
+        }  else{
+            if (fgets(line, sizeof(line), stdin) == NULL){  //EOF
+                if(interactive) printf("\n");
+                break;
+            }
         }
         
+        strncpy(history[history_cnt%100], line, MAX_LINE);
+        history_cnt++;
+
         uint32_t len = strlen(line);
         if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
 
